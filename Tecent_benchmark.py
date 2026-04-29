@@ -61,6 +61,19 @@ def _pip_install(packages: list[str], optional: bool = False) -> bool:
         raise RuntimeError(msg) from exc
 
 
+def _pip_install_each(packages: list[str], optional: bool = False) -> None:
+    failed: list[str] = []
+    for package in packages:
+        try:
+            _pip_install([package], optional=optional)
+        except RuntimeError as exc:
+            failed.append(f"{package}: {exc}")
+            if optional:
+                continue
+    if failed and not optional:
+        raise RuntimeError("Required dependency install failed:\n" + "\n\n".join(failed))
+
+
 def install_dependencies(skip_dali: bool) -> None:
     """Install missing dependencies. DALI is optional and may fail."""
     required = []
@@ -75,7 +88,7 @@ def install_dependencies(skip_dali: bool) -> None:
     if not _has_module("skimage"):
         required.append("scikit-image")
     if required:
-        _pip_install(required)
+        _pip_install_each(required)
 
     if not skip_dali and not _has_module("nvidia.dali"):
         _pip_install(["nvidia-dali-cuda120"], optional=True)
