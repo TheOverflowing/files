@@ -232,6 +232,37 @@ def cuda_runtime_is_newer(runtime: str | None, driver_cuda: str | None) -> bool:
     return runtime_pair > driver_pair
 
 
+def extract_opencv_build_info() -> dict[str, Any]:
+    info = cv2.getBuildInformation()
+    lines = info.splitlines()
+
+    def first_value(prefix: str) -> str | None:
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                return stripped.split(":", 1)[1].strip() if ":" in stripped else stripped
+        return None
+
+    def section_after(title: str, limit: int = 12) -> list[str]:
+        for idx, line in enumerate(lines):
+            if line.strip() == title:
+                section: list[str] = []
+                for next_line in lines[idx + 1 : idx + 1 + limit]:
+                    stripped = next_line.strip()
+                    if not stripped:
+                        break
+                    section.append(stripped)
+                return section
+        return []
+
+    return {
+        "cpu_hw_features": section_after("CPU/HW features:"),
+        "ipp": first_value("Intel IPP"),
+        "parallel_framework": first_value("Parallel framework"),
+        "opencl": section_after("OpenCL:"),
+    }
+
+
 TORCH_CUDA_OK, TORCH_CUDA_ERROR = torch_cuda_status()
 CUPY_CUDA_OK, CUPY_CUDA_ERROR = cupy_cuda_status()
 
@@ -250,6 +281,50 @@ def mean_fps(frame_count: int, times: list[float]) -> tuple[float, float]:
     fps = [frame_count / t for t in times]
     fps_mean = statistics.mean(fps)
     return fps_mean, 1000.0 / fps_mean
+
+
+def fps_stats(frame_count: int, times: list[float]) -> dict[str, float]:
+    values = [frame_count / t for t in times]
+    mean = statistics.mean(values)
+    return {
+        "fps": mean,
+        "fps_mean": mean,
+        "fps_median": statistics.median(values),
+        "fps_min": min(values),
+        "fps_max": max(values),
+        "ms_per_frame": 1000.0 / mean,
+    }
+
+
+def benchmark_loop_stats(
+    name: str,
+    frame_count: int,
+    repeats: int,
+    warmup: int,
+    fn: Callable[[], None],
+    sync: Callable[[], None] | None = None,
+) -> tuple[dict[str, float], list[float]]:
+    for _ in range(warmup):
+        fn()
+    if sync:
+        sync()
+    times = []
+    for _ in range(repeats):
+        if sync:
+            sync()
+        t0 = time.perf_counter()
+        for _ in range(frame_count):
+            fn()
+        if sync:
+            sync()
+        times.append(time.perf_counter() - t0)
+    stats = fps_stats(frame_count, times)
+    print(
+        f"  {name:70s} mean={stats['fps_mean']:9.2f} fps  "
+        f"median={stats['fps_median']:9.2f}  min={stats['fps_min']:9.2f}  "
+        f"max={stats['fps_max']:9.2f}  {stats['ms_per_frame']:8.3f} ms/frame"
+    )
+    return stats, times
 
 
 def record_error(errors: list[dict[str, str]], method: str, exc: BaseException) -> None:
@@ -519,6 +594,7 @@ def environment_info() -> dict[str, Any]:
         "torch_version": torch.__version__,
         "cupy_version": getattr(cp, "__version__", None) if cp is not None else None,
         "opencv_version": cv2.__version__,
+        "opencv_build": extract_opencv_build_info(),
         "dali_available": pipeline_def is not None,
         "cpu_cores": os.cpu_count(),
         "python_version": platform.python_version(),
@@ -553,34 +629,55 @@ def bench_rgb_resize(image: np.ndarray, frames: int, repeats: int, warmup: int, 
     rows: list[dict[str, Any]] = []
     baseline_fps = None
     original_cv2_threads = cv2.getNumThreads()
+    part1_repeats = 5
+    if not image.flags["C_CONTIGUOUS"]:
+        image = np.ascontiguousarray(image)
+    interpolations = [
+        ("INTER_NEAREST", cv2.INTER_NEAREST),
+        ("INTER_LINEAR", cv2.INTER_LINEAR),
+        ("INTER_AREA", cv2.INTER_AREA),
+    ]
 
     try:
         for threads in [1, 2, 4, 8, 12, 16, 24, 28]:
-            method = f"OpenCV resize CPU threads={threads}"
-            try:
-                cv2.setNumThreads(threads)
+            for interpolation_name, interpolation_flag in interpolations:
+                for preallocate_dst in [False, True]:
+                    method = (
+                        f"OpenCV resize CPU threads={threads} {interpolation_name} "
+                        f"preallocate_dst={preallocate_dst}"
+                    )
+                    try:
+                        cv2.setNumThreads(threads)
+                        dst = np.empty((DST_H, DST_W, image.shape[2]), dtype=image.dtype) if preallocate_dst else None
 
-                def fn() -> None:
-                    cv2.resize(image, (DST_W, DST_H), interpolation=cv2.INTER_LINEAR)
+                        def fn() -> None:
+                            if dst is None:
+                                cv2.resize(image, (DST_W, DST_H), interpolation=interpolation_flag)
+                            else:
+                                cv2.resize(image, (DST_W, DST_H), dst=dst, interpolation=interpolation_flag)
 
-                fps, ms, times = benchmark_loop(method, frames, repeats, warmup, fn)
-                row = {
-                    "method": method,
-                    "fps": fps,
-                    "ms_per_frame": ms,
-                    "includes_transfer": False,
-                    "gpu_only": False,
-                    "cv2_threads": threads,
-                    "times_sec": times,
-                }
-                rows.append(row)
-                if threads == 1:
-                    baseline_fps = fps
-                    add_speedup(rows, baseline_fps)
-                elif baseline_fps:
-                    row["speedup"] = fps / baseline_fps
-            except Exception as exc:
-                record_error(errors, method, exc)
+                        stats, times = benchmark_loop_stats(method, frames, part1_repeats, warmup, fn)
+                        row = {
+                            "method": method,
+                            **stats,
+                            "includes_transfer": False,
+                            "gpu_only": False,
+                            "cv2_threads": threads,
+                            "interpolation": interpolation_name,
+                            "preallocate_dst": preallocate_dst,
+                            "input_contiguous": bool(image.flags["C_CONTIGUOUS"]),
+                            "output_shape": [DST_H, DST_W, image.shape[2]],
+                            "repeats": part1_repeats,
+                            "times_sec": times,
+                        }
+                        rows.append(row)
+                        if threads == 1 and interpolation_name == "INTER_LINEAR" and not preallocate_dst:
+                            baseline_fps = row["fps"]
+                            add_speedup(rows, baseline_fps)
+                        elif baseline_fps:
+                            row["speedup"] = row["fps"] / baseline_fps
+                    except Exception as exc:
+                        record_error(errors, method, exc)
     finally:
         cv2.setNumThreads(original_cv2_threads if original_cv2_threads > 0 else 0)
 
@@ -939,6 +1036,54 @@ def compute_quality(image: np.ndarray, errors: list[dict[str, str]]) -> list[dic
     return rows
 
 
+def analyze_rgb_resize(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    cpu_rows = [
+        row
+        for row in rows
+        if row.get("method", "").startswith("OpenCV resize CPU")
+        and row.get("interpolation") is not None
+    ]
+    if not cpu_rows:
+        return {}
+    best_fps = max(cpu_rows, key=lambda row: row.get("fps", 0.0))
+    best_speedup = max(cpu_rows, key=lambda row: row.get("speedup", 0.0))
+    helped = 0
+    hurt = 0
+    best_dst_gain = None
+    grouped: dict[tuple[Any, Any], dict[bool, dict[str, Any]]] = {}
+    for row in cpu_rows:
+        key = (row.get("cv2_threads"), row.get("interpolation"))
+        grouped.setdefault(key, {})[bool(row.get("preallocate_dst"))] = row
+    for group in grouped.values():
+        no_dst = group.get(False)
+        with_dst = group.get(True)
+        if not no_dst or not with_dst:
+            continue
+        gain = with_dst["fps"] / no_dst["fps"] if no_dst.get("fps") else 0.0
+        if gain > 1.01:
+            helped += 1
+        elif gain < 0.99:
+            hurt += 1
+        if best_dst_gain is None or gain > best_dst_gain["gain"]:
+            best_dst_gain = {
+                "gain": gain,
+                "cv2_threads": with_dst.get("cv2_threads"),
+                "interpolation": with_dst.get("interpolation"),
+                "without_dst_fps": no_dst.get("fps"),
+                "with_dst_fps": with_dst.get("fps"),
+            }
+    return {
+        "best_fps": best_fps,
+        "best_speedup": best_speedup,
+        "best_threads": best_fps.get("cv2_threads"),
+        "best_interpolation": best_fps.get("interpolation"),
+        "best_preallocate_dst": best_fps.get("preallocate_dst"),
+        "dst_preallocation_helped_groups": helped,
+        "dst_preallocation_hurt_groups": hurt,
+        "best_dst_gain": best_dst_gain,
+    }
+
+
 def print_summary(results: dict[str, Any]) -> None:
     print("\n" + "=" * 88)
     print("Summary")
@@ -952,6 +1097,11 @@ def print_summary(results: dict[str, Any]) -> None:
     )
     print(f"CPU cores visible to Python: {env.get('cpu_cores')}  Python: {env.get('python_version')}")
     print(f"Note: {env.get('note')}")
+    opencv_build = env.get("opencv_build") or {}
+    print("OpenCV CPU/HW features:", "; ".join(opencv_build.get("cpu_hw_features") or []))
+    print(f"OpenCV IPP: {opencv_build.get('ipp')}")
+    print(f"OpenCV Parallel framework: {opencv_build.get('parallel_framework')}")
+    print("OpenCV OpenCL:", "; ".join(opencv_build.get("opencl") or []))
     if not env.get("torch_cuda_available"):
         print(f"PyTorch CUDA skipped: {env.get('torch_cuda_error')}")
     if not env.get("cupy_cuda_available"):
@@ -974,7 +1124,45 @@ def print_summary(results: dict[str, Any]) -> None:
                 cells.append(str(val).ljust(widths[col]))
             print("  " + "  ".join(cells))
 
-    table("RGB resize", results["rgb_resize"], ["method", "fps", "ms_per_frame", "speedup", "includes_transfer"])
+    table(
+        "RGB resize OpenCV CPU",
+        [row for row in results["rgb_resize"] if row.get("method", "").startswith("OpenCV resize CPU")],
+        [
+            "method",
+            "fps_mean",
+            "fps_median",
+            "fps_min",
+            "fps_max",
+            "ms_per_frame",
+            "speedup",
+            "cv2_threads",
+            "interpolation",
+            "preallocate_dst",
+        ],
+    )
+    rgb_analysis = results.get("rgb_resize_analysis") or {}
+    if rgb_analysis:
+        best = rgb_analysis["best_fps"]
+        best_speedup = rgb_analysis["best_speedup"]
+        print("\nRGB resize analysis")
+        print(
+            f"  Highest fps: {best['fps']:.3f} fps with threads={best.get('cv2_threads')}, "
+            f"{best.get('interpolation')}, preallocate_dst={best.get('preallocate_dst')}"
+        )
+        print(
+            f"  Highest speedup: {best_speedup.get('speedup', 0.0):.3f}x with threads={best_speedup.get('cv2_threads')}, "
+            f"{best_speedup.get('interpolation')}, preallocate_dst={best_speedup.get('preallocate_dst')}"
+        )
+        dst_gain = rgb_analysis.get("best_dst_gain")
+        if dst_gain:
+            print(
+                f"  Best dst preallocation gain: {dst_gain['gain']:.3f}x at threads={dst_gain['cv2_threads']}, "
+                f"{dst_gain['interpolation']} ({dst_gain['without_dst_fps']:.3f} -> {dst_gain['with_dst_fps']:.3f} fps)"
+            )
+        print(
+            f"  dst preallocation helped {rgb_analysis.get('dst_preallocation_helped_groups')} groups "
+            f"and hurt {rgb_analysis.get('dst_preallocation_hurt_groups')} groups using a +/-1% threshold."
+        )
     mjpeg_rows = sorted(results["mjpeg_decode_resize"], key=lambda row: row.get("fps", 0.0), reverse=True)
     table(
         "MJPEG decode + resize top 30",
@@ -1141,7 +1329,53 @@ def write_markdown_report(results: dict[str, Any], path: str) -> None:
         "output_shape",
     ]
     env = results["environment"]
+    opencv_build = env.get("opencv_build") or {}
+    rgb_rows = [
+        row
+        for row in results.get("rgb_resize", [])
+        if row.get("method", "").startswith("OpenCV resize CPU")
+    ]
+    rgb_columns = [
+        "method",
+        "fps_mean",
+        "fps_median",
+        "fps_min",
+        "fps_max",
+        "ms_per_frame",
+        "speedup",
+        "cv2_threads",
+        "interpolation",
+        "preallocate_dst",
+    ]
+    rgb_analysis = results.get("rgb_resize_analysis") or {}
     notes = analyze_worker_scaling(rows) + analyze_copyback(rows)
+    rgb_analysis_lines: list[str] = []
+    if rgb_analysis:
+        best = rgb_analysis["best_fps"]
+        best_speedup = rgb_analysis["best_speedup"]
+        rgb_analysis_lines.extend(
+            [
+                (
+                    f"- Highest fps: {best['fps']:.3f} fps with threads={best.get('cv2_threads')}, "
+                    f"{best.get('interpolation')}, preallocate_dst={best.get('preallocate_dst')}."
+                ),
+                (
+                    f"- Highest speedup: {best_speedup.get('speedup', 0.0):.3f}x with "
+                    f"threads={best_speedup.get('cv2_threads')}, {best_speedup.get('interpolation')}, "
+                    f"preallocate_dst={best_speedup.get('preallocate_dst')}."
+                ),
+            ]
+        )
+        dst_gain = rgb_analysis.get("best_dst_gain")
+        if dst_gain:
+            rgb_analysis_lines.append(
+                f"- Best dst preallocation gain: {dst_gain['gain']:.3f}x at threads={dst_gain['cv2_threads']}, "
+                f"{dst_gain['interpolation']} ({dst_gain['without_dst_fps']:.3f} -> {dst_gain['with_dst_fps']:.3f} fps)."
+            )
+        rgb_analysis_lines.append(
+            f"- dst preallocation helped {rgb_analysis.get('dst_preallocation_helped_groups')} groups and "
+            f"hurt {rgb_analysis.get('dst_preallocation_hurt_groups')} groups using a +/-1% threshold."
+        )
     content = [
         "# Tencent A10 MJPEG Benchmark",
         "",
@@ -1153,6 +1387,17 @@ def write_markdown_report(results: dict[str, Any], path: str) -> None:
         f"- CUDA driver: {env.get('nvidia_smi_cuda_version')}",
         f"- PyTorch CUDA runtime: {env.get('torch_cuda_runtime')}",
         f"- OpenCV: {env.get('opencv_version')}",
+        f"- OpenCV CPU/HW features: {'; '.join(opencv_build.get('cpu_hw_features') or [])}",
+        f"- OpenCV IPP: {opencv_build.get('ipp')}",
+        f"- OpenCV Parallel framework: {opencv_build.get('parallel_framework')}",
+        f"- OpenCV OpenCL: {'; '.join(opencv_build.get('opencl') or [])}",
+        "",
+        "## RGB Resize CPU Summary",
+        "",
+        markdown_table(rgb_rows, rgb_columns),
+        "### RGB Resize Automatic Analysis",
+        "",
+        *(rgb_analysis_lines or ["_No RGB resize analysis available._"]),
         "",
         "## Baseline",
         "",
@@ -1225,6 +1470,7 @@ def main() -> None:
             "dst_h": DST_H,
             "frames": frames,
             "repeats": repeats,
+            "rgb_resize_repeats": 5,
             "warmup": warmup,
             "jpeg_quality": JPEG_QUALITY,
             "mjpeg_frames_per_type": mjpeg_frames,
@@ -1239,6 +1485,7 @@ def main() -> None:
         "quality": compute_quality(image, errors),
         "errors": errors,
     }
+    results["rgb_resize_analysis"] = analyze_rgb_resize(results["rgb_resize"])
 
     with open(ARGS.output, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
