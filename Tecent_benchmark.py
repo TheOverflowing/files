@@ -1,8 +1,8 @@
 """
-Google Colab Tesla T4 CUDA resize benchmark.
+Tencent Cloud CUDA resize benchmark.
 
 Workload: 3840x1920 RGB -> 1920x1080, plus MJPEG decode + resize.
-Output: t4_results.json
+Output: tencent_results.json
 
 The script intentionally avoids building OpenCV with CUDA. It uses OpenCV for
 CPU baselines and PyTorch, CuPy, and optional NVIDIA DALI/nvJPEG for GPU paths.
@@ -47,7 +47,7 @@ def _pip_install(packages: list[str], optional: bool = False) -> bool:
 
 
 def install_dependencies(skip_dali: bool) -> None:
-    """Install missing Colab dependencies. DALI is optional and may fail."""
+    """Install missing dependencies. DALI is optional and may fail."""
     required = []
     if not _has_module("cv2"):
         required.append("opencv-python-headless")
@@ -67,19 +67,21 @@ def install_dependencies(skip_dali: bool) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tesla T4 CUDA resize benchmark for Google Colab.")
+    parser = argparse.ArgumentParser(description="Tencent Cloud CUDA resize benchmark.")
     parser.add_argument("--skip-dali", action="store_true", help="Skip NVIDIA DALI install and benchmarks.")
     parser.add_argument("--quick", action="store_true", help="Use 50 frames x 1 repeat for faster iteration.")
     parser.add_argument("--frames", type=int, default=None, help="Override measured frames per repeat.")
     parser.add_argument("--repeats", type=int, default=None, help="Override measured repeats.")
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations. Default: 20.")
     parser.add_argument("--mjpeg-frames", type=int, default=None, help="Override MJPEG frames per image type. Default: 80, or 20 with --quick.")
-    parser.add_argument("--output", default="t4_results.json", help="JSON output path. Default: t4_results.json.")
+    parser.add_argument("--output", default="tencent_results.json", help="JSON output path. Default: tencent_results.json.")
+    parser.add_argument("--no-install-deps", action="store_true", help="Do not pip-install missing Python dependencies.")
     return parser.parse_known_args()[0]
 
 
 ARGS = parse_args()
-install_dependencies(ARGS.skip_dali)
+if not ARGS.no_install_deps:
+    install_dependencies(ARGS.skip_dali)
 
 import cv2
 import numpy as np
@@ -116,15 +118,95 @@ DEFAULT_REPEATS = 3
 QUICK_FRAMES = 50
 QUICK_REPEATS = 1
 MJPEG_FRAMES_PER_TYPE = 80
+SERVER_NOTE = "Tencent Cloud GPU server: expected A10-class GPU, 24 GB VRAM, 28 CPU cores, 116 GB RAM, 30+ TFLOPS SP."
+
+
+def nvidia_smi_info() -> dict[str, Any]:
+    """Return GPU/driver details even when PyTorch CUDA cannot initialize."""
+    query = "name,memory.total,driver_version,cuda_version"
+    cmd = [
+        "nvidia-smi",
+        f"--query-gpu={query}",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, timeout=5).strip()
+    except Exception as exc:
+        return {"nvidia_smi_error": str(exc)}
+    if not output:
+        return {"nvidia_smi_error": "nvidia-smi returned no GPU rows"}
+
+    first = output.splitlines()[0]
+    parts = [part.strip() for part in first.split(",")]
+    info: dict[str, Any] = {"nvidia_smi_raw": first}
+    if len(parts) >= 1:
+        info["gpu"] = parts[0]
+    if len(parts) >= 2:
+        try:
+            info["vram_gb"] = round(float(parts[1]) / 1024.0, 2)
+        except ValueError:
+            info["vram_total_mib"] = parts[1]
+    if len(parts) >= 3:
+        info["nvidia_driver_version"] = parts[2]
+    if len(parts) >= 4:
+        info["nvidia_smi_cuda_version"] = parts[3]
+    return info
+
+
+def torch_cuda_status() -> tuple[bool, str | None]:
+    try:
+        if torch.cuda.is_available():
+            return True, None
+        return False, "torch.cuda.is_available() is False"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def cupy_cuda_status() -> tuple[bool, str | None]:
+    if cp is None:
+        return False, "CuPy import failed"
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            return False, "CuPy sees no CUDA devices"
+        probe = cp.arange(4, dtype=cp.float32)
+        _ = (probe + 1).sum().item()
+        cp.cuda.Stream.null.synchronize()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def parse_cuda_major_minor(version: str | None) -> tuple[int, int] | None:
+    if not version:
+        return None
+    parts = version.split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return major, minor
+    except (TypeError, ValueError):
+        return None
+
+
+def cuda_runtime_is_newer(runtime: str | None, driver_cuda: str | None) -> bool:
+    runtime_pair = parse_cuda_major_minor(runtime)
+    driver_pair = parse_cuda_major_minor(driver_cuda)
+    if runtime_pair is None or driver_pair is None:
+        return False
+    return runtime_pair > driver_pair
+
+
+TORCH_CUDA_OK, TORCH_CUDA_ERROR = torch_cuda_status()
+CUPY_CUDA_OK, CUPY_CUDA_ERROR = cupy_cuda_status()
 
 
 def sync_torch() -> None:
-    if torch.cuda.is_available():
+    if TORCH_CUDA_OK:
         torch.cuda.synchronize()
 
 
 def sync_cupy() -> None:
-    if cp is not None:
+    if CUPY_CUDA_OK:
         cp.cuda.Stream.null.synchronize()
 
 
@@ -215,7 +297,7 @@ def benchmark_dataset(
 
     Unlike benchmark_loop(fn_that_processes_80_frames, frame_count=1), this keeps
     the warmup count in units of frames. That matters for MJPEG because full CPU
-    decode is expensive on Colab's small CPU allocation.
+    decode is expensive and should not be hidden inside one measured call.
     """
     if not items:
         raise ValueError("benchmark_dataset requires at least one item")
@@ -377,7 +459,13 @@ def environment_info() -> dict[str, Any]:
     info: dict[str, Any] = {
         "gpu": None,
         "vram_gb": None,
-        "cuda_version": torch.version.cuda,
+        "nvidia_driver_version": None,
+        "nvidia_smi_cuda_version": None,
+        "torch_cuda_runtime": torch.version.cuda,
+        "torch_cuda_available": TORCH_CUDA_OK,
+        "torch_cuda_error": TORCH_CUDA_ERROR,
+        "cupy_cuda_available": CUPY_CUDA_OK,
+        "cupy_cuda_error": CUPY_CUDA_ERROR,
         "torch_version": torch.__version__,
         "cupy_version": getattr(cp, "__version__", None) if cp is not None else None,
         "opencv_version": cv2.__version__,
@@ -385,9 +473,17 @@ def environment_info() -> dict[str, Any]:
         "cpu_cores": os.cpu_count(),
         "python_version": platform.python_version(),
         "platform": platform.platform(),
-        "note": "Colab T4 commonly exposes only 2 CPU cores, unlike a 10-core M4 Mac.",
+        "note": SERVER_NOTE,
     }
-    if torch.cuda.is_available():
+    smi = nvidia_smi_info()
+    info.update(smi)
+    if not TORCH_CUDA_OK and cuda_runtime_is_newer(torch.version.cuda, info.get("nvidia_smi_cuda_version")):
+        info["torch_cuda_error"] = (
+            f"Installed PyTorch CUDA runtime is {torch.version.cuda}, but the NVIDIA driver reports CUDA "
+            f"{info.get('nvidia_smi_cuda_version')}. Install a PyTorch build matching the driver, "
+            "or update the NVIDIA driver."
+        )
+    if TORCH_CUDA_OK:
         props = torch.cuda.get_device_properties(0)
         info["gpu"] = props.name
         info["vram_gb"] = round(props.total_memory / (1024**3), 2)
@@ -430,7 +526,7 @@ def bench_rgb_resize(image: np.ndarray, frames: int, repeats: int, warmup: int, 
         except Exception as exc:
             record_error(errors, method, exc)
 
-    if torch.cuda.is_available():
+    if TORCH_CUDA_OK:
         for batch_size in [1, 4, 8, 16, 32]:
             method = f"PyTorch F.interpolate GPU-only batch={batch_size}"
             try:
@@ -487,7 +583,7 @@ def bench_rgb_resize(image: np.ndarray, frames: int, repeats: int, warmup: int, 
             except Exception as exc:
                 record_error(errors, method, exc)
 
-    if cp is not None:
+    if CUPY_CUDA_OK:
         method = "CuPy cupyx.scipy.ndimage.zoom GPU-only"
         try:
             img_gpu = cp.asarray(image)
@@ -645,7 +741,7 @@ def bench_mjpeg_decode_resize(
 def bench_batch_scaling(image: np.ndarray, frames: int, repeats: int, warmup: int, errors: list[dict[str, str]]) -> list[dict[str, Any]]:
     print("\n=== Part 3: PyTorch GPU batch throughput scaling ===")
     rows: list[dict[str, Any]] = []
-    if not torch.cuda.is_available():
+    if not TORCH_CUDA_OK:
         return rows
 
     for batch_size in [1, 2, 4, 8, 16, 32, 64]:
@@ -686,7 +782,7 @@ def compute_quality(image: np.ndarray, errors: list[dict[str, str]]) -> list[dic
         rows.append(row)
         print(f"  {method:54s} MSE={mse:10.4f} PSNR={psnr:8.3f} SSIM={ssim_val:.6f}")
 
-    if torch.cuda.is_available():
+    if TORCH_CUDA_OK:
         method = "PyTorch F.interpolate bilinear align_corners=False"
         try:
             with torch.no_grad():
@@ -698,7 +794,7 @@ def compute_quality(image: np.ndarray, errors: list[dict[str, str]]) -> list[dic
         except Exception as exc:
             record_error(errors, method, exc)
 
-    if cp is not None:
+    if CUPY_CUDA_OK:
         method = "CuPy cupyx.scipy.ndimage.zoom order=1"
         try:
             img_gpu = cp.asarray(image)
@@ -726,9 +822,18 @@ def print_summary(results: dict[str, Any]) -> None:
     print("Summary")
     print("=" * 88)
     env = results["environment"]
-    print(f"GPU: {env.get('gpu')}  VRAM: {env.get('vram_gb')} GB  CUDA: {env.get('cuda_version')}")
+    print(
+        f"GPU: {env.get('gpu')}  VRAM: {env.get('vram_gb')} GB  "
+        f"Driver: {env.get('nvidia_driver_version')}  "
+        f"CUDA driver: {env.get('nvidia_smi_cuda_version')}  "
+        f"PyTorch CUDA runtime: {env.get('torch_cuda_runtime')}"
+    )
     print(f"CPU cores visible to Python: {env.get('cpu_cores')}  Python: {env.get('python_version')}")
-    print("Note: Colab T4 commonly exposes only 2 CPU cores; CPU results are not expected to match a 10-core M4.")
+    print(f"Note: {env.get('note')}")
+    if not env.get("torch_cuda_available"):
+        print(f"PyTorch CUDA skipped: {env.get('torch_cuda_error')}")
+    if not env.get("cupy_cuda_available"):
+        print(f"CuPy CUDA skipped: {env.get('cupy_cuda_error')}")
 
     def table(title: str, rows: list[dict[str, Any]], columns: list[str]) -> None:
         print("\n" + title)
@@ -764,14 +869,16 @@ def main() -> None:
     warmup = ARGS.warmup
 
     print("=" * 88)
-    print("T4 CUDA resize benchmark")
+    print("Tencent Cloud CUDA resize benchmark")
     print("=" * 88)
     env = environment_info()
     for key, value in env.items():
         print(f"{key:18s}: {value}")
 
-    if not torch.cuda.is_available():
-        print("WARNING: torch.cuda.is_available() is False. GPU benchmarks will be skipped or fail.")
+    if not TORCH_CUDA_OK:
+        print(f"WARNING: PyTorch CUDA benchmarks will be skipped: {env.get('torch_cuda_error')}")
+    if not CUPY_CUDA_OK:
+        print(f"WARNING: CuPy CUDA benchmarks will be skipped: {CUPY_CUDA_ERROR}")
 
     print(f"\nConfig: frames={frames}, mjpeg_frames={mjpeg_frames}, repeats={repeats}, warmup={warmup}, quick={ARGS.quick}")
     print(f"Workload: {SRC_W}x{SRC_H} RGB -> {DST_W}x{DST_H}, JPEG quality={JPEG_QUALITY}")
