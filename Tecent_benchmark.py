@@ -36,8 +36,23 @@ def _pip_install(packages: list[str], optional: bool = False) -> bool:
     cmd = [sys.executable, "-m", "pip", "install", "-q"] + packages
     try:
         print("Installing:", " ".join(packages))
-        subprocess.check_call(cmd)
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
         return True
+    except subprocess.CalledProcessError as exc:
+        output = exc.output or ""
+        if "Permission denied" in output or "Errno 13" in output:
+            user_cmd = [sys.executable, "-m", "pip", "install", "--user", "-q"] + packages
+            try:
+                print("System install lacked permission; retrying with --user:", " ".join(packages))
+                subprocess.check_output(user_cmd, stderr=subprocess.STDOUT, text=True)
+                return True
+            except subprocess.CalledProcessError as user_exc:
+                output += "\n\n--user retry output:\n" + (user_exc.output or "")
+        msg = f"WARNING: pip install failed for {' '.join(packages)}:\n{output.strip()}"
+        if optional:
+            print(msg)
+            return False
+        raise RuntimeError(msg) from exc
     except Exception as exc:
         msg = f"WARNING: pip install failed for {' '.join(packages)}: {exc}"
         if optional:

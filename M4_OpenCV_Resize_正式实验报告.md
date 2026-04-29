@@ -222,7 +222,7 @@ MJPEG 部分以完整 4K 解码后再 `INTER_LINEAR` 缩放为基准，其吞吐
 
 从机制上看，MJPEG 帧级任务已经包含解码、缩减解码和最终 resize。若每个任务内部再使用多个 OpenCV 线程，会增加线程调度、缓存竞争和核心争用。Apple Silicon M4 同时包含性能核心和能效核心，线程池数量较高时，任务可能跨不同类型核心调度；此时让单帧任务保持较小的内部并行粒度，更有利于多帧任务在核心之间均匀排布。`T=2, W=10` 与 `T=1, W=14` 的结果非常接近，说明轻度混合并行并非不可用，但在本次测试中没有稳定优势。
 
-### 4.7 Tesla T4 GPU 补充结果
+### 4.7 Colab 的 Tesla T4 GPU 补充结果
 
 T4 上的 RGB resize 结果显示，纯 GPU resize kernel 很快，但端到端路径受到 CPU/GPU 数据传输和 pipeline 开销限制。以 Colab CPU 上的 OpenCV 单线程 resize 116.6 fps 为基准，PyTorch 预加载 GPU tensor 的最高吞吐量为 2290.2 fps，即 19.65×；但包含每帧 CPU 到 GPU 传输和结果拷回的 PyTorch end-to-end 路径最高只有 112.1 fps，未超过 CPU baseline。
 

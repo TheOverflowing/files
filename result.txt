@@ -1,0 +1,175 @@
+ubuntu@VM-0-13-ubuntu:~/temp/test1/files$ python3 Tecent_benchmark.py
+========================================================================================
+Tencent Cloud CUDA resize benchmark
+========================================================================================
+gpu               : NVIDIA A10
+vram_gb           : 21.99
+nvidia_driver_version: None
+nvidia_smi_cuda_version: None
+torch_cuda_runtime: 12.1
+torch_cuda_available: True
+torch_cuda_error  : None
+cupy_cuda_available: False
+cupy_cuda_error   : CUDA_ERROR_INVALID_IMAGE: device kernel image is invalid
+torch_version     : 2.5.1+cu121
+cupy_version      : 14.0.1
+opencv_version    : 4.13.0
+dali_available    : True
+cpu_cores         : 28
+python_version    : 3.10.12
+platform          : Linux-5.15.0-126-generic-x86_64-with-glibc2.35
+note              : Tencent Cloud GPU server: expected A10-class GPU, 24 GB VRAM, 28 CPU cores, 116 GB RAM, 30+ TFLOPS SP.
+nvidia_smi_error  : Command '['nvidia-smi', '--query-gpu=name,memory.total,driver_version,cuda_version', '--format=csv,noheader,nounits']' returned non-zero exit status 2.
+cuda_capability   : 8.6
+WARNING: CuPy CUDA benchmarks will be skipped: CUDA_ERROR_INVALID_IMAGE: device kernel image is invalid
+
+Config: frames=200, mjpeg_frames=80, repeats=3, warmup=20, quick=False
+Workload: 3840x1920 RGB -> 1920x1080, JPEG quality=85
+
+=== Part 1: Pure RGB resize ===
+  OpenCV resize CPU threads=1                               220.69 fps     4.531 ms/frame
+  OpenCV resize CPU threads=4                               633.07 fps     1.580 ms/frame
+  PyTorch F.interpolate GPU-only batch=1                   4512.99 fps     0.222 ms/frame
+  PyTorch F.interpolate GPU-only batch=4                   4465.78 fps     0.224 ms/frame
+  PyTorch F.interpolate GPU-only batch=8                   4452.90 fps     0.225 ms/frame
+  PyTorch F.interpolate GPU-only batch=16                  4423.23 fps     0.226 ms/frame
+  PyTorch F.interpolate GPU-only batch=32                  4371.87 fps     0.229 ms/frame
+  PyTorch F.interpolate end-to-end batch=1                  360.42 fps     2.775 ms/frame
+  PyTorch F.interpolate end-to-end batch=4                  332.92 fps     3.004 ms/frame
+  PyTorch F.interpolate end-to-end batch=8                  167.57 fps     5.968 ms/frame
+  PyTorch F.interpolate end-to-end batch=16                 161.64 fps     6.187 ms/frame
+  PyTorch F.interpolate end-to-end batch=32                 167.50 fps     5.970 ms/frame
+  NVIDIA DALI resize GPU pipeline end-to-end                425.66 fps     2.349 ms/frame
+
+=== Part 2: MJPEG decode + resize ===
+
+-- low_texture (113.8 KiB JPEG) --
+  OpenCV imdecode full + resize CPU threads=1                70.50 fps    14.184 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)      471.72 fps     2.120 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)      646.57 fps     1.547 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)     939.79 fps     1.064 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2    678.41 fps     1.474 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4    895.52 fps     1.117 ms/frame
+
+-- high_frequency (5596.7 KiB JPEG) --
+  OpenCV imdecode full + resize CPU threads=1                14.90 fps    67.097 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)       49.87 fps    20.050 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)      107.87 fps     9.270 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)     154.19 fps     6.485 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2     96.74 fps    10.337 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4    157.02 fps     6.369 ms/frame
+
+-- natural_like (172.4 KiB JPEG) --
+  OpenCV imdecode full + resize CPU threads=1                60.56 fps    16.512 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)      299.86 fps     3.335 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)      567.91 fps     1.761 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)     779.31 fps     1.283 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2    540.27 fps     1.851 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4    796.93 fps     1.255 ms/frame
+
+-- mixed (2778.5 KiB JPEG) --
+  OpenCV imdecode full + resize CPU threads=1                24.85 fps    40.248 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)       86.34 fps    11.582 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)      183.19 fps     5.459 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)     266.08 fps     3.758 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2    173.86 fps     5.752 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4    316.70 fps     3.158 ms/frame
+
+-- text_like (392.4 KiB JPEG) --
+  OpenCV imdecode full + resize CPU threads=1                62.85 fps    15.912 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)      303.94 fps     3.290 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)      499.18 fps     2.003 ms/frame
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)     785.08 fps     1.274 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2    466.77 fps     2.142 ms/frame
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4    632.16 fps     1.582 ms/frame
+
+=== Part 3: PyTorch GPU batch throughput scaling ===
+  PyTorch F.interpolate preloaded batch=1                  4506.25 fps     0.222 ms/frame
+  PyTorch F.interpolate preloaded batch=2                  4488.82 fps     0.223 ms/frame
+  PyTorch F.interpolate preloaded batch=4                  4472.53 fps     0.224 ms/frame
+  PyTorch F.interpolate preloaded batch=8                  4451.74 fps     0.225 ms/frame
+  PyTorch F.interpolate preloaded batch=16                 4422.95 fps     0.226 ms/frame
+  PyTorch F.interpolate preloaded batch=32                 4364.14 fps     0.229 ms/frame
+  PyTorch F.interpolate preloaded batch=64                 4265.53 fps     0.234 ms/frame
+
+=== Part 4: Image quality verification ===
+  PyTorch F.interpolate bilinear align_corners=False     MSE=    0.3799 PSNR=  52.334 SSIM=0.996935
+  NVIDIA DALI resize linear                              MSE=    2.8801 PSNR=  43.537 SSIM=0.959753
+
+========================================================================================
+Summary
+========================================================================================
+GPU: NVIDIA A10  VRAM: 21.99 GB  Driver: None  CUDA driver: None  PyTorch CUDA runtime: 12.1
+CPU cores visible to Python: 28  Python: 3.10.12
+Note: Tencent Cloud GPU server: expected A10-class GPU, 24 GB VRAM, 28 CPU cores, 116 GB RAM, 30+ TFLOPS SP.
+CuPy CUDA skipped: CUDA_ERROR_INVALID_IMAGE: device kernel image is invalid
+
+RGB resize
+  method                                      fps                 ms_per_frame         speedup             includes_transfer
+  ------------------------------------------  ------------------  -------------------  ------------------  -----------------
+  OpenCV resize CPU threads=1                 220.694             4.531                1.000               False
+  OpenCV resize CPU threads=4                 633.075             1.580                2.869               False
+  PyTorch F.interpolate GPU-only batch=1      4512.992            0.222                20.449              False
+  PyTorch F.interpolate GPU-only batch=4      4465.779            0.224                20.235              False
+  PyTorch F.interpolate GPU-only batch=8      4452.896            0.225                20.177              False
+  PyTorch F.interpolate GPU-only batch=16     4423.230            0.226                20.042              False
+  PyTorch F.interpolate GPU-only batch=32     4371.868            0.229                19.810              False
+  PyTorch F.interpolate end-to-end batch=1    360.419             2.775                1.633               True
+  PyTorch F.interpolate end-to-end batch=4    332.921             3.004                1.509               True
+  PyTorch F.interpolate end-to-end batch=8    167.569             5.968                0.759               True
+  PyTorch F.interpolate end-to-end batch=16   161.639             6.187                0.732               True
+  PyTorch F.interpolate end-to-end batch=32   167.503             5.970                0.759               True
+  NVIDIA DALI resize GPU pipeline end-to-end  425.662             2.349                1.929               True
+
+MJPEG decode + resize
+  method                                                  image_type      fps                 ms_per_frame
+  ------------------------------------------------------  --------------  ------------------  ------------------
+  OpenCV imdecode full + resize CPU threads=1             low_texture     70.501              14.184
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)    low_texture     471.724             2.120
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)    low_texture     646.566             1.547
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)   low_texture     939.787             1.064
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2  low_texture     678.406             1.474
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4  low_texture     895.519             1.117
+  OpenCV imdecode full + resize CPU threads=1             high_frequency  14.904              67.097
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)    high_frequency  49.874              20.050
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)    high_frequency  107.873             9.270
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)   high_frequency  154.194             6.485
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2  high_frequency  96.744              10.337
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4  high_frequency  157.021             6.369
+  OpenCV imdecode full + resize CPU threads=1             natural_like    60.561              16.512
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)    natural_like    299.862             3.335
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)    natural_like    567.908             1.761
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)   natural_like    779.306             1.283
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2  natural_like    540.269             1.851
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4  natural_like    796.931             1.255
+  OpenCV imdecode full + resize CPU threads=1             mixed           24.846              40.248
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)    mixed           86.344              11.582
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)    mixed           183.193             5.459
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)   mixed           266.080             3.758
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2  mixed           173.863             5.752
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4  mixed           316.700             3.158
+  OpenCV imdecode full + resize CPU threads=1             text_like       62.845              15.912
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(4)    text_like       303.944             3.290
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(8)    text_like       499.183             2.003
+  OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool(12)   text_like       785.083             1.274
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=2  text_like       466.766             2.142
+  NVIDIA DALI nvJPEG mixed decode + GPU resize threads=4  text_like       632.161             1.582
+
+Batch scaling
+  batch_size  fps                ms_per_frame
+  ----------  -----------------  -------------------
+  1           4506.250           0.222
+  2           4488.819           0.223
+  4           4472.529           0.224
+  8           4451.739           0.225
+  16          4422.948           0.226
+  32          4364.142           0.229
+  64          4265.534           0.234
+
+Quality
+  method                                              mse                  psnr                ssim
+  --------------------------------------------------  -------------------  ------------------  ------------------
+  PyTorch F.interpolate bilinear align_corners=False  0.380                52.334              0.997
+  NVIDIA DALI resize linear                           2.880                43.537              0.960
+
+Wrote tencent_results.json
