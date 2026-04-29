@@ -1,0 +1,130 @@
+[
+  {
+    "name": "OpenCV INTER_LINEAR (1 thread)",
+    "category": "opencv",
+    "fps_mean": 76.1,
+    "fps_stdev": 10.0,
+    "ms_per_frame": 13.14,
+    "notes": "single-threaded baseline"
+  },
+  {
+    "name": "OpenCV INTER_LINEAR (2 threads)",
+    "category": "opencv",
+    "fps_mean": 98.4,
+    "fps_stdev": 0.8,
+    "ms_per_frame": 10.16,
+    "notes": "OpenCV pthreads, all cores"
+  },
+  {
+    "name": "OpenCV INTER_NEAREST (2 threads)",
+    "category": "opencv",
+    "fps_mean": 194.3,
+    "fps_stdev": 12.8,
+    "ms_per_frame": 5.15,
+    "notes": "fastest interp, lowest quality"
+  },
+  {
+    "name": "OpenCV INTER_AREA (2 threads)",
+    "category": "opencv",
+    "fps_mean": 20.1,
+    "fps_stdev": 0.1,
+    "ms_per_frame": 49.77,
+    "notes": "best for downsample quality"
+  },
+  {
+    "name": "OpenCV INTER_CUBIC (2 threads)",
+    "category": "opencv",
+    "fps_mean": 67.3,
+    "fps_stdev": 0.7,
+    "ms_per_frame": 14.86,
+    "notes": "higher quality, slower"
+  },
+  {
+    "name": "OpenCV LINEAR + ThreadPool(2) over frames",
+    "category": "opencv",
+    "fps_mean": 82.5,
+    "fps_stdev": 26.3,
+    "ms_per_frame": 12.12,
+    "notes": "frame-level parallelism"
+  },
+  {
+    "name": "Pillow BILINEAR (1 thread)",
+    "category": "pillow",
+    "fps_mean": 16.1,
+    "fps_stdev": 1.2,
+    "ms_per_frame": 62.07,
+    "notes": ""
+  },
+  {
+    "name": "Pillow NEAREST (1 thread)",
+    "category": "pillow",
+    "fps_mean": 268.0,
+    "fps_stdev": 7.1,
+    "ms_per_frame": 3.73,
+    "notes": ""
+  },
+  {
+    "name": "pyvips resize linear",
+    "category": "pyvips",
+    "fps_mean": 46.3,
+    "fps_stdev": 4.6,
+    "ms_per_frame": 21.6,
+    "notes": ""
+  },
+  {
+    "name": "NumPy strided nearest (2:1 decim)",
+    "category": "numpy",
+    "fps_mean": 43.3,
+    "fps_stdev": 0.4,
+    "ms_per_frame": 23.09,
+    "notes": "nearest-equivalent"
+  },
+  {
+    "name": "OpenCV imdecode + resize LINEAR",
+    "category": "mjpeg-opencv",
+    "fps_mean": 20.1,
+    "fps_stdev": 0.2,
+    "ms_per_frame": 49.81,
+    "notes": "baseline: decode at full 4K, then resize"
+  },
+  {
+    "name": "OpenCV imdecode REDUCED_2 + resize",
+    "category": "mjpeg-opencv",
+    "fps_mean": 28.1,
+    "fps_stdev": 0.3,
+    "ms_per_frame": 35.63,
+    "notes": "fuses scale-during-decode (DCT-domain 1/2)"
+  },
+  {
+    "name": "Pillow draft + resize BILINEAR",
+    "category": "mjpeg-pillow",
+    "fps_mean": 11.936595464125443,
+    "fps_stdev": 0.27514880801802055,
+    "ms_per_frame": 83.77598143502695,
+    "notes": "draft() uses libjpeg DCT scaling"
+  },
+  {
+    "name": "Pillow full-decode + resize BILINEAR",
+    "category": "mjpeg-pillow",
+    "fps_mean": 11.813097411751297,
+    "fps_stdev": 0.1310135221920314,
+    "ms_per_frame": 84.65180343008359,
+    "notes": "no draft mode"
+  },
+  {
+    "name": "pyvips jpegload(shrink=2) + resize",
+    "category": "mjpeg-pyvips",
+    "fps_mean": 23.11662948619716,
+    "fps_stdev": 2.002247848264127,
+    "ms_per_frame": 43.258901588447216,
+    "notes": "libjpeg-turbo block-shrink inside vips"
+  },
+  {
+    "name": "OpenCV REDUCED_2 + resize, ThreadPool(2)",
+    "category": "mjpeg-opencv",
+    "fps_mean": 35.697095536849716,
+    "fps_stdev": 2.1669593093738038,
+    "ms_per_frame": 28.013483589097916,
+    "notes": "frame-level parallelism on top of fused decode"
+  }
+]
