@@ -552,29 +552,37 @@ def bench_rgb_resize(image: np.ndarray, frames: int, repeats: int, warmup: int, 
     print("\n=== Part 1: Pure RGB resize ===")
     rows: list[dict[str, Any]] = []
     baseline_fps = None
+    original_cv2_threads = cv2.getNumThreads()
 
-    for threads in [1, 4]:
-        method = f"OpenCV resize CPU threads={threads}"
-        try:
-            cv2.setNumThreads(threads)
+    try:
+        for threads in [1, 2, 4, 8, 12, 16, 24, 28]:
+            method = f"OpenCV resize CPU threads={threads}"
+            try:
+                cv2.setNumThreads(threads)
 
-            def fn() -> None:
-                cv2.resize(image, (DST_W, DST_H), interpolation=cv2.INTER_LINEAR)
+                def fn() -> None:
+                    cv2.resize(image, (DST_W, DST_H), interpolation=cv2.INTER_LINEAR)
 
-            fps, ms, times = benchmark_loop(method, frames, repeats, warmup, fn)
-            row = {
-                "method": method,
-                "fps": fps,
-                "ms_per_frame": ms,
-                "includes_transfer": False,
-                "gpu_only": False,
-                "times_sec": times,
-            }
-            rows.append(row)
-            if threads == 1:
-                baseline_fps = fps
-        except Exception as exc:
-            record_error(errors, method, exc)
+                fps, ms, times = benchmark_loop(method, frames, repeats, warmup, fn)
+                row = {
+                    "method": method,
+                    "fps": fps,
+                    "ms_per_frame": ms,
+                    "includes_transfer": False,
+                    "gpu_only": False,
+                    "cv2_threads": threads,
+                    "times_sec": times,
+                }
+                rows.append(row)
+                if threads == 1:
+                    baseline_fps = fps
+                    add_speedup(rows, baseline_fps)
+                elif baseline_fps:
+                    row["speedup"] = fps / baseline_fps
+            except Exception as exc:
+                record_error(errors, method, exc)
+    finally:
+        cv2.setNumThreads(original_cv2_threads if original_cv2_threads > 0 else 0)
 
     if TORCH_CUDA_OK:
         for batch_size in [1, 4, 8, 16, 32]:
