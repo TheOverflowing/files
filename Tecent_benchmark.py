@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations. Default: 20.")
     parser.add_argument("--mjpeg-frames", type=int, default=None, help="Override MJPEG frames per image type. Default: 80, or 20 with --quick.")
     parser.add_argument("--output", default="tencent_results.json", help="JSON output path. Default: tencent_results.json.")
+    parser.add_argument("--markdown-output", default=None, help="Markdown summary output path. Default: <output>.md")
     parser.add_argument("--no-install-deps", action="store_true", help="Do not pip-install missing Python dependencies.")
     return parser.parse_known_args()[0]
 
@@ -119,6 +120,13 @@ QUICK_FRAMES = 50
 QUICK_REPEATS = 1
 MJPEG_FRAMES_PER_TYPE = 80
 SERVER_NOTE = "Tencent Cloud GPU server: expected A10-class GPU, 24 GB VRAM, 28 CPU cores, 116 GB RAM, 30+ TFLOPS SP."
+OPENCV_WORKER_SWEEP = [1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48]
+OPENCV_MIXED_THREAD_SWEEP = {
+    2: [4, 8, 12, 16, 20, 24],
+    4: [4, 6, 8, 12],
+}
+DALI_BATCH_SWEEP = [8, 16, 32, 64]
+DALI_PREFETCH_SWEEP = [2, 3, 4]
 
 
 def nvidia_smi_info() -> dict[str, Any]:
@@ -430,11 +438,21 @@ def maybe_make_dali_resize_pipeline(batch_size: int, batch: list[np.ndarray]):
     return pipe
 
 
-def maybe_make_dali_jpeg_pipeline(batch_size: int, num_threads: int, batch: list[np.ndarray]):
+def maybe_make_dali_jpeg_pipeline(
+    batch_size: int,
+    num_threads: int,
+    batch: list[np.ndarray],
+    prefetch_queue_depth: int = 2,
+):
     if pipeline_def is None:
         return None
 
-    @pipeline_def(batch_size=batch_size, num_threads=num_threads, device_id=0)
+    @pipeline_def(
+        batch_size=batch_size,
+        num_threads=num_threads,
+        device_id=0,
+        prefetch_queue_depth=prefetch_queue_depth,
+    )
     def jpeg_pipe():
         encoded = dali_fn.external_source(source=lambda: batch, device="cpu", batch=True)
         decoded = dali_fn.decoders.image(encoded, device="mixed", output_type=dali_types.RGB)
@@ -453,6 +471,10 @@ def dali_run_resize(pipe: Any) -> None:
 def dali_run_jpeg(pipe: Any) -> None:
     out = pipe.run()[0]
     out.as_cpu()
+
+
+def dali_run_jpeg_no_copyback(pipe: Any) -> None:
+    _ = pipe.run()[0]
 
 
 def environment_info() -> dict[str, Any]:
@@ -661,8 +683,22 @@ def bench_rgb_resize(image: np.ndarray, frames: int, repeats: int, warmup: int, 
 def bench_mjpeg_decode_resize(
     diverse: list[dict[str, Any]], mjpeg_frames: int, repeats: int, warmup: int, errors: list[dict[str, str]]
 ) -> list[dict[str, Any]]:
-    print("\n=== Part 2: MJPEG decode + resize ===")
+    print("\n=== Part 2: MJPEG DCT reduced decode + ThreadPool sweep ===")
     rows: list[dict[str, Any]] = []
+    baseline_fps_by_type: dict[str, float] = {}
+    decode_modes = [
+        ("IMREAD_COLOR", cv2.IMREAD_COLOR),
+        ("IMREAD_REDUCED_COLOR_2", cv2.IMREAD_REDUCED_COLOR_2),
+        ("IMREAD_REDUCED_COLOR_4", cv2.IMREAD_REDUCED_COLOR_4),
+        ("IMREAD_REDUCED_COLOR_8", cv2.IMREAD_REDUCED_COLOR_8),
+    ]
+    interpolations = [
+        ("INTER_LINEAR", cv2.INTER_LINEAR),
+        ("INTER_NEAREST", cv2.INTER_NEAREST),
+    ]
+    cv2_worker_configs = [(1, workers) for workers in OPENCV_WORKER_SWEEP]
+    for cv2_threads, workers_list in OPENCV_MIXED_THREAD_SWEEP.items():
+        cv2_worker_configs.extend((cv2_threads, workers) for workers in workers_list)
 
     for item in diverse:
         image_type = item["image_type"]
@@ -670,71 +706,121 @@ def bench_mjpeg_decode_resize(
         buffers = [jpeg] * mjpeg_frames
         print(f"\n-- {image_type} ({item['jpeg_bytes'] / 1024:.1f} KiB JPEG) --")
 
-        method = "OpenCV imdecode full + resize CPU threads=1"
-        try:
-            cv2.setNumThreads(1)
+        for decode_name, decode_flag in decode_modes:
+            for op_name, interp_name, interp_flag in [("decode only", "none", None)] + [
+                ("decode + resize", name, flag) for name, flag in interpolations
+            ]:
+                for cv2_threads, workers in cv2_worker_configs:
+                    interp_part = "" if interp_name == "none" else f" {interp_name}"
+                    method = f"OpenCV {decode_name} {op_name}{interp_part} cv2_threads={cv2_threads} workers={workers}"
+                    try:
+                        cv2.setNumThreads(cv2_threads)
 
-            def process_one(buf: bytes) -> None:
-                arr = np.frombuffer(buf, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                cv2.resize(img, (DST_W, DST_H), interpolation=cv2.INTER_LINEAR)
+                        def process_one(buf: bytes) -> tuple[int, int, int]:
+                            arr = np.frombuffer(buf, dtype=np.uint8)
+                            img = cv2.imdecode(arr, decode_flag)
+                            if img is None:
+                                raise RuntimeError("cv2.imdecode returned None")
+                            if interp_flag is not None:
+                                img = cv2.resize(img, (DST_W, DST_H), interpolation=interp_flag)
+                            return tuple(int(v) for v in img.shape)
 
-            def process_batch(batch: list[bytes]) -> None:
-                for buf in batch:
-                    process_one(buf)
+                        output_shape = list(process_one(jpeg))
 
-            fps, ms, times = benchmark_dataset(method, buffers, repeats, warmup, process_batch)
-            rows.append({"method": method, "image_type": image_type, "fps": fps, "ms_per_frame": ms, "times_sec": times})
-        except Exception as exc:
-            record_error(errors, f"{method} {image_type}", exc)
+                        def process_batch(batch: list[bytes]) -> None:
+                            if workers == 1:
+                                for buf in batch:
+                                    process_one(buf)
+                            else:
+                                with ThreadPoolExecutor(max_workers=workers) as pool:
+                                    list(pool.map(process_one, batch))
 
-        for workers in [4, 8, 12]:
-            method = f"OpenCV IMREAD_REDUCED_COLOR_2 + resize ThreadPool({workers})"
-            try:
-                cv2.setNumThreads(1)
-
-                def process_one(buf: bytes) -> None:
-                    arr = np.frombuffer(buf, dtype=np.uint8)
-                    img = cv2.imdecode(arr, cv2.IMREAD_REDUCED_COLOR_2)
-                    cv2.resize(img, (DST_W, DST_H), interpolation=cv2.INTER_LINEAR)
-
-                def process_batch(batch: list[bytes]) -> None:
-                    with ThreadPoolExecutor(max_workers=workers) as pool:
-                        list(pool.map(process_one, batch))
-
-                fps, ms, times = benchmark_dataset(method, buffers, repeats, warmup, process_batch)
-                rows.append({"method": method, "image_type": image_type, "fps": fps, "ms_per_frame": ms, "times_sec": times})
-            except Exception as exc:
-                record_error(errors, f"{method} {image_type}", exc)
-
-        if pipeline_def is not None:
-            for threads in [2, 4]:
-                method = f"NVIDIA DALI nvJPEG mixed decode + GPU resize threads={threads}"
-                try:
-                    batch_size = 8
-                    encoded = [np.frombuffer(jpeg, dtype=np.uint8) for _ in range(batch_size)]
-                    pipe = maybe_make_dali_jpeg_pipeline(batch_size=batch_size, num_threads=threads, batch=encoded)
-                    batches_per_repeat = max(1, math.ceil(mjpeg_frames / batch_size))
-
-                    def fn() -> None:
-                        dali_run_jpeg(pipe)
-
-                    fps, ms, times = benchmark_batches(method, batches_per_repeat, batch_size, repeats, warmup, fn, sync_torch)
-                    rows.append(
-                        {
+                        fps, ms, times = benchmark_dataset(method, buffers, repeats, warmup, process_batch)
+                        row = {
                             "method": method,
                             "image_type": image_type,
+                            "backend": "opencv",
+                            "decode_mode": decode_name,
+                            "operation": op_name,
+                            "interpolation": interp_name,
+                            "cv2_threads": cv2_threads,
+                            "workers": workers,
+                            "dali_batch_size": None,
+                            "dali_prefetch": None,
+                            "copy_back": None,
                             "fps": fps,
                             "ms_per_frame": ms,
-                            "batch_size": batch_size,
+                            "speedup_ratio": None,
+                            "output_shape": output_shape,
                             "times_sec": times,
                         }
-                    )
-                except Exception as exc:
-                    record_error(errors, f"{method} {image_type}", exc)
+                        rows.append(row)
+                        if (
+                            decode_name == "IMREAD_COLOR"
+                            and op_name == "decode + resize"
+                            and interp_name == "INTER_LINEAR"
+                            and cv2_threads == 1
+                            and workers == 1
+                        ):
+                            baseline_fps_by_type[image_type] = fps
+                    except Exception as exc:
+                        record_error(errors, f"{method} {image_type}", exc)
+
+        if pipeline_def is not None:
+            for batch_size in DALI_BATCH_SWEEP:
+                for prefetch in DALI_PREFETCH_SWEEP:
+                    for copy_back in [False, True]:
+                        method = (
+                            "NVIDIA DALI nvJPEG mixed decode + GPU resize "
+                            f"batch={batch_size} prefetch={prefetch} copy_back={copy_back}"
+                        )
+                        try:
+                            encoded = [np.frombuffer(jpeg, dtype=np.uint8) for _ in range(batch_size)]
+                            pipe = maybe_make_dali_jpeg_pipeline(
+                                batch_size=batch_size,
+                                num_threads=4,
+                                batch=encoded,
+                                prefetch_queue_depth=prefetch,
+                            )
+                            batches_per_repeat = max(1, math.ceil(mjpeg_frames / batch_size))
+
+                            def fn() -> None:
+                                if copy_back:
+                                    dali_run_jpeg(pipe)
+                                else:
+                                    dali_run_jpeg_no_copyback(pipe)
+
+                            fps, ms, times = benchmark_batches(method, batches_per_repeat, batch_size, repeats, warmup, fn, sync_torch)
+                            rows.append(
+                                {
+                                    "method": method,
+                                    "image_type": image_type,
+                                    "backend": "dali",
+                                    "decode_mode": "nvJPEG mixed",
+                                    "operation": "decode + resize",
+                                    "interpolation": "INTER_LINEAR",
+                                    "cv2_threads": None,
+                                    "workers": None,
+                                    "dali_threads": 4,
+                                    "dali_batch_size": batch_size,
+                                    "dali_prefetch": prefetch,
+                                    "copy_back": copy_back,
+                                    "fps": fps,
+                                    "ms_per_frame": ms,
+                                    "speedup_ratio": None,
+                                    "output_shape": [DST_H, DST_W, 3],
+                                    "times_sec": times,
+                                }
+                            )
+                        except Exception as exc:
+                            record_error(errors, f"{method} {image_type}", exc)
         else:
             print("  DALI unavailable; skipping nvJPEG GPU decode path for this image type.")
 
+    for row in rows:
+        baseline = baseline_fps_by_type.get(row.get("image_type"))
+        if baseline:
+            row["speedup_ratio"] = row["fps"] / baseline
     return rows
 
 
@@ -853,7 +939,12 @@ def print_summary(results: dict[str, Any]) -> None:
             print("  " + "  ".join(cells))
 
     table("RGB resize", results["rgb_resize"], ["method", "fps", "ms_per_frame", "speedup", "includes_transfer"])
-    table("MJPEG decode + resize", results["mjpeg_decode_resize"], ["method", "image_type", "fps", "ms_per_frame"])
+    mjpeg_rows = sorted(results["mjpeg_decode_resize"], key=lambda row: row.get("fps", 0.0), reverse=True)
+    table(
+        "MJPEG decode + resize top 30",
+        mjpeg_rows[:30],
+        ["method", "image_type", "fps", "ms_per_frame", "speedup_ratio", "output_shape"],
+    )
     table("Batch scaling", results["batch_scaling"], ["batch_size", "fps", "ms_per_frame"])
     table("Quality", results["quality"], ["method", "mse", "psnr", "ssim"])
     if results.get("errors"):
@@ -862,11 +953,191 @@ def print_summary(results: dict[str, Any]) -> None:
             print(f"  {err['method']}: {err['error']}")
 
 
+def markdown_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    if isinstance(value, list):
+        return "x".join(str(v) for v in value)
+    return str(value)
+
+
+def markdown_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
+    if not rows:
+        return "_No rows._\n"
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(markdown_value(row.get(col)) for col in columns) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def best_row(rows: list[dict[str, Any]], predicate: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | None:
+    candidates = [row for row in rows if predicate(row)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda row: row.get("fps", 0.0))
+
+
+def analyze_worker_scaling(rows: list[dict[str, Any]]) -> list[str]:
+    notes: list[str] = []
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("backend") != "opencv" or row.get("cv2_threads") != 1:
+            continue
+        key = (
+            row.get("image_type"),
+            row.get("decode_mode"),
+            row.get("operation"),
+            row.get("interpolation"),
+        )
+        groups.setdefault(key, []).append(row)
+
+    plateau_count = 0
+    for key, group in groups.items():
+        by_worker = {row.get("workers"): row for row in group}
+        if not all(worker in by_worker for worker in [24, 32, 40, 48]):
+            continue
+        best = max(group, key=lambda row: row.get("fps", 0.0))
+        tail_best = max(by_worker[worker].get("fps", 0.0) for worker in [32, 40, 48])
+        fps_24 = by_worker[24].get("fps", 0.0)
+        if fps_24 >= 0.95 * tail_best or best.get("workers") < 32:
+            plateau_count += 1
+    if plateau_count:
+        notes.append(
+            f"OpenCV worker sweep shows plateau in {plateau_count} cv2_threads=1 groups: "
+            "after workers stop improving, the bottleneck is likely memory bandwidth, JPEG entropy decode, "
+            "or ThreadPool scheduling overhead rather than available CPU cores."
+        )
+    else:
+        notes.append("OpenCV worker sweep did not show a strong plateau before the largest tested worker counts.")
+    return notes
+
+
+def analyze_copyback(rows: list[dict[str, Any]]) -> list[str]:
+    dali_rows = [row for row in rows if row.get("backend") == "dali"]
+    best_no_copy = best_row(dali_rows, lambda row: row.get("copy_back") is False)
+    best_copy = best_row(dali_rows, lambda row: row.get("copy_back") is True)
+    if not best_no_copy or not best_copy:
+        return []
+    ratio = best_no_copy["fps"] / best_copy["fps"] if best_copy.get("fps") else 0.0
+    if ratio >= 1.25:
+        return [
+            f"DALI without copy-back is {ratio:.2f}x faster than with copy-back at the best points, "
+            "so GPU-to-CPU transfer/synchronization is a major end-to-end bottleneck."
+        ]
+    return [
+        f"DALI without copy-back is {ratio:.2f}x the with-copy-back best result; copy-back is not the dominant measured bottleneck."
+    ]
+
+
+def recommendation_line(label: str, row: dict[str, Any] | None) -> str:
+    if row is None:
+        return f"- {label}: no result"
+    return (
+        f"- {label}: {row.get('method')} on {row.get('image_type')} -> "
+        f"{row.get('fps'):.2f} fps, {row.get('ms_per_frame'):.3f} ms/frame, "
+        f"{row.get('speedup_ratio'):.2f}x baseline"
+    )
+
+
+def write_markdown_report(results: dict[str, Any], path: str) -> None:
+    rows = results["mjpeg_decode_resize"]
+    sorted_rows = sorted(rows, key=lambda row: row.get("fps", 0.0), reverse=True)
+    opencv_rows = [row for row in rows if row.get("backend") == "opencv"]
+    dali_rows = [row for row in rows if row.get("backend") == "dali"]
+    quality_best = best_row(
+        opencv_rows,
+        lambda row: row.get("decode_mode") == "IMREAD_REDUCED_COLOR_2"
+        and row.get("operation") == "decode + resize"
+        and row.get("interpolation") == "INTER_LINEAR",
+    )
+    speed_best = best_row(
+        opencv_rows,
+        lambda row: row.get("decode_mode") == "IMREAD_REDUCED_COLOR_8"
+        and row.get("operation") == "decode + resize"
+        and row.get("interpolation") in {"INTER_LINEAR", "INTER_NEAREST"},
+    )
+    gpu_best = best_row(dali_rows, lambda row: True)
+    baseline_rows = [
+        row
+        for row in rows
+        if row.get("backend") == "opencv"
+        and row.get("decode_mode") == "IMREAD_COLOR"
+        and row.get("operation") == "decode + resize"
+        and row.get("interpolation") == "INTER_LINEAR"
+        and row.get("cv2_threads") == 1
+        and row.get("workers") == 1
+    ]
+    columns = [
+        "method",
+        "image_type",
+        "decode_mode",
+        "operation",
+        "interpolation",
+        "cv2_threads",
+        "workers",
+        "dali_batch_size",
+        "dali_prefetch",
+        "copy_back",
+        "fps",
+        "ms_per_frame",
+        "speedup_ratio",
+        "output_shape",
+    ]
+    env = results["environment"]
+    notes = analyze_worker_scaling(rows) + analyze_copyback(rows)
+    content = [
+        "# Tencent A10 MJPEG Benchmark",
+        "",
+        "## Environment",
+        "",
+        f"- GPU: {env.get('gpu')} ({env.get('vram_gb')} GB)",
+        f"- CPU cores visible to Python: {env.get('cpu_cores')}",
+        f"- NVIDIA driver: {env.get('nvidia_driver_version')}",
+        f"- CUDA driver: {env.get('nvidia_smi_cuda_version')}",
+        f"- PyTorch CUDA runtime: {env.get('torch_cuda_runtime')}",
+        f"- OpenCV: {env.get('opencv_version')}",
+        "",
+        "## Baseline",
+        "",
+        "Baseline is `cv2.IMREAD_COLOR + cv2.resize(..., INTER_LINEAR)`, `cv2.setNumThreads(1)`, `workers=1`.",
+        "",
+        markdown_table(baseline_rows, columns),
+        "## Top Results",
+        "",
+        markdown_table(sorted_rows[:50], columns),
+        "## Recommended Configurations",
+        "",
+        recommendation_line("Quality priority", quality_best),
+        recommendation_line("Speed priority", speed_best),
+        recommendation_line("GPU pipeline reference", gpu_best),
+        "",
+        "## Automatic Analysis",
+        "",
+    ]
+    content.extend(f"- {note}" for note in notes)
+    content.extend(
+        [
+            "",
+            "## Full MJPEG Results",
+            "",
+            markdown_table(sorted_rows, columns),
+        ]
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(content))
+
+
 def main() -> None:
     frames = ARGS.frames if ARGS.frames is not None else (QUICK_FRAMES if ARGS.quick else DEFAULT_FRAMES)
     repeats = ARGS.repeats if ARGS.repeats is not None else (QUICK_REPEATS if ARGS.quick else DEFAULT_REPEATS)
     mjpeg_frames = ARGS.mjpeg_frames if ARGS.mjpeg_frames is not None else (20 if ARGS.quick else MJPEG_FRAMES_PER_TYPE)
     warmup = ARGS.warmup
+    markdown_output = ARGS.markdown_output or os.path.splitext(ARGS.output)[0] + ".md"
 
     print("=" * 88)
     print("Tencent Cloud CUDA resize benchmark")
@@ -899,6 +1170,10 @@ def main() -> None:
             "warmup": warmup,
             "jpeg_quality": JPEG_QUALITY,
             "mjpeg_frames_per_type": mjpeg_frames,
+            "opencv_worker_sweep": OPENCV_WORKER_SWEEP,
+            "opencv_mixed_thread_sweep": OPENCV_MIXED_THREAD_SWEEP,
+            "dali_batch_sweep": DALI_BATCH_SWEEP,
+            "dali_prefetch_sweep": DALI_PREFETCH_SWEEP,
         },
         "rgb_resize": bench_rgb_resize(image, frames, repeats, warmup, errors),
         "mjpeg_decode_resize": bench_mjpeg_decode_resize(diverse, mjpeg_frames, repeats, warmup, errors),
@@ -909,8 +1184,10 @@ def main() -> None:
 
     with open(ARGS.output, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
+    write_markdown_report(results, markdown_output)
     print_summary(results)
     print(f"\nWrote {ARGS.output}")
+    print(f"Wrote {markdown_output}")
 
 
 if __name__ == "__main__":
