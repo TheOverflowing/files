@@ -11,7 +11,6 @@ CPU baselines and PyTorch, CuPy, and optional NVIDIA DALI/nvJPEG for GPU paths.
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import math
 import os
@@ -27,8 +26,9 @@ from typing import Any, Callable
 
 def _has_module(module_name: str) -> bool:
     try:
-        return importlib.util.find_spec(module_name) is not None
-    except ModuleNotFoundError:
+        __import__(module_name)
+        return True
+    except ImportError:
         return False
 
 
@@ -973,6 +973,16 @@ def print_summary(results: dict[str, Any]) -> None:
         mjpeg_rows[:30],
         ["method", "image_type", "fps", "ms_per_frame", "speedup_ratio", "output_shape"],
     )
+    gpu_resident_rows = sorted(
+        [row for row in results["mjpeg_decode_resize"] if is_gpu_resident(row)],
+        key=lambda row: row.get("speedup_ratio") or 0.0,
+        reverse=True,
+    )
+    table(
+        "GPU-resident DALI top 20",
+        gpu_resident_rows[:20],
+        ["method", "image_type", "fps", "ms_per_frame", "speedup_ratio", "dali_batch_size", "dali_prefetch"],
+    )
     table("Batch scaling", results["batch_scaling"], ["batch_size", "fps", "ms_per_frame"])
     table("Quality", results["quality"], ["method", "mse", "psnr", "ssim"])
     if results.get("errors"):
@@ -1072,11 +1082,17 @@ def recommendation_line(label: str, row: dict[str, Any] | None) -> str:
     )
 
 
+def is_gpu_resident(row: dict[str, Any]) -> bool:
+    return row.get("backend") == "dali" and row.get("copy_back") is False
+
+
 def write_markdown_report(results: dict[str, Any], path: str) -> None:
     rows = results["mjpeg_decode_resize"]
     sorted_rows = sorted(rows, key=lambda row: row.get("fps", 0.0), reverse=True)
     opencv_rows = [row for row in rows if row.get("backend") == "opencv"]
     dali_rows = [row for row in rows if row.get("backend") == "dali"]
+    gpu_resident_rows = [row for row in rows if is_gpu_resident(row)]
+    gpu_resident_sorted = sorted(gpu_resident_rows, key=lambda row: row.get("speedup_ratio") or 0.0, reverse=True)
     quality_best = best_row(
         opencv_rows,
         lambda row: row.get("decode_mode") == "IMREAD_REDUCED_COLOR_2"
@@ -1089,7 +1105,7 @@ def write_markdown_report(results: dict[str, Any], path: str) -> None:
         and row.get("operation") == "decode + resize"
         and row.get("interpolation") in {"INTER_LINEAR", "INTER_NEAREST"},
     )
-    gpu_best = best_row(dali_rows, lambda row: True)
+    gpu_best = best_row(dali_rows, is_gpu_resident)
     baseline_rows = [
         row
         for row in rows
@@ -1138,8 +1154,14 @@ def write_markdown_report(results: dict[str, Any], path: str) -> None:
         "## Top Results",
         "",
         markdown_table(sorted_rows[:50], columns),
+        "## GPU-Resident Results",
+        "",
+        "These DALI/nvJPEG rows keep resized frames on GPU (`copy_back=False`) and are the primary target for maximum speedup.",
+        "",
+        markdown_table(gpu_resident_sorted, columns),
         "## Recommended Configurations",
         "",
+        recommendation_line("Maximum speedup ratio, GPU-resident", gpu_best),
         recommendation_line("Quality priority", quality_best),
         recommendation_line("Speed priority", speed_best),
         recommendation_line("GPU pipeline reference", gpu_best),
